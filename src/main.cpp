@@ -1,227 +1,165 @@
-#include <Arduino.h>
-#include <vector>
-#include <string>
-
-#include "esp_bt_main.h"
-#include "esp_bt_device.h"
-#include "esp_gap_bt_api.h"
-
-#include <NimBLEDevice.h>
-
 #include "AudioTools.h"
 #include "AudioTools/AudioLibs/AudioBoardStream.h"
 #include "AudioTools/AudioLibs/A2DPStream.h"
+#include <Wire.h>
+#include "driver/gpio.h"   // pour gpio_reset_pin()
+#include "soc/io_mux_reg.h"
 
-// --- Paramètres Audio ---
+// -------- Audio --------
 AudioInfo info(44100, 2, 16);
 BluetoothA2DPSource a2dp_source;
 AudioBoardStream i2s(AudioKitEs8388V1);
 const int16_t BYTES_PER_FRAME = 4;
 
-// --- Stockage des devices ---
-struct BtDevice {
-  String name;
-  String mac_str; // adresse MAC format texte "AA:BB:CC:DD:EE:FF"
-};
+// Seuil de silence
+const int16_t SILENCE_THRESHOLD = 400;
 
-std::vector<BtDevice> devices_found;
+// -------- LED RGB --------
+const int LED_RED   = 4;
+const int LED_BLUE  = 22;
+const int LED_GREEN = 13;   // GPIO13 (MTCK) -> nécessite désactivation JTAG
 
-// --- BLE Service et caractéristiques ---
-#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHAR_NOTIFY_UUID    "beb5483e-36e1-4688-b7f5-ea07361b26a8" // envoie la liste d'appareils
-#define CHAR_WRITE_UUID     "d3b5f2e0-9f3a-11ee-be56-0242ac120002" // reçoit l'adresse MAC choisie
+// -------- Bouton -------- 
+const int BUTTON_PIN = 5;
 
-NimBLECharacteristic* pCharacteristicNotify = nullptr;
-NimBLECharacteristic* pCharacteristicWrite = nullptr;
+unsigned long lastUpdate = 0;
+int ledState = 0;
 
-bool notifyClients = false;
+// -------- I2C BQ25186 --------
+const uint8_t BQ25186_ADDR = 0x6A;  // 7-bit address du BQ25186
 
-// --- Prototype ---
-void startBTScan();
-void connectToSelectedDevice(const String& mac);
-
-// ---------------------------------------------------
-// Convertit adresse binaire en string "XX:XX:XX:XX:XX:XX"
-String macToString(esp_bd_addr_t bda) {
-  char mac[18];
-  sprintf(mac, "%02X:%02X:%02X:%02X:%02X:%02X",
-          bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
-  return String(mac);
+// --- Fonctions basiques I2C ---
+void bq25186_writeRegister(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(BQ25186_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission();
 }
 
-// --- Bluetooth Classique callback pour scan ---
-void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
-  switch (event) {
-    case ESP_BT_GAP_DISC_RES_EVT: {
-      esp_bd_addr_t bda;
-      memcpy(bda, param->disc_res.bda, ESP_BD_ADDR_LEN);
-      String mac = macToString(bda);
-      String device_name = "Inconnu";
-
-      // Cherche nom dans props
-      for (int i = 0; i < param->disc_res.num_prop; i++) {
-        esp_bt_gap_dev_prop_t *p = param->disc_res.prop + i;
-        if (p->type == ESP_BT_GAP_DEV_PROP_BDNAME) {
-          device_name = String((char*)p->val, p->len);
-        }
-      }
-
-      // Vérifie si déjà dans la liste
-      bool found = false;
-      for (auto& d : devices_found) {
-        if (d.mac_str == mac) {
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        devices_found.push_back({device_name, mac});
-        Serial.printf("Appareil trouvé: %s [%s]\n", device_name.c_str(), mac.c_str());
-      }
-      break;
-    }
-    case ESP_BT_GAP_DISC_STATE_CHANGED_EVT: {
-      if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
-        Serial.println("Scan terminé.");
-
-        // Envoie la liste via BLE (notifications)
-        if (notifyClients && pCharacteristicNotify) {
-          for (auto& d : devices_found) {
-            String msg = d.mac_str + " - " + d.name;
-            pCharacteristicNotify->setValue(msg.c_str());
-            pCharacteristicNotify->notify();
-            delay(100); // petit délai entre notifications
-          }
-        }
-      } else if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STARTED) {
-        Serial.println("Scan démarré...");
-      }
-      break;
-    }
-    default:
-      break;
-  }
+uint8_t bq25186_readRegister(uint8_t reg) {
+  Wire.beginTransmission(BQ25186_ADDR);
+  Wire.write(reg);
+  Wire.endTransmission(false);   // restart
+  Wire.requestFrom(BQ25186_ADDR, (uint8_t)1);
+  return Wire.read();
 }
 
-// --- Callback quand un client BLE écrit dans la caractéristique (adresse MAC reçue) ---
-class WriteCallback : public NimBLECharacteristicCallbacks {
-  void onWrite(NimBLECharacteristic* pChar) override {
-    std::string rxValue = pChar->getValue();
-    if (rxValue.length() == 17) { // format MAC "XX:XX:XX:XX:XX:XX"
-      String receivedMac = String(rxValue.c_str());
+// --- Read-Modify-Write ---
+void bq25186_updateBits(uint8_t reg, uint8_t mask, uint8_t value) {
+  uint8_t current = bq25186_readRegister(reg);
+  uint8_t updated = (current & ~mask) | (value & mask);
+  bq25186_writeRegister(reg, updated);
 
-      Serial.printf("Adresse reçue via BLE: %s\n", receivedMac.c_str());
-
-      // Vérifie dans la liste
-      bool found = false;
-      for (auto& d : devices_found) {
-        if (d.mac_str == receivedMac) {
-          found = true;
-          break;
-        }
-      }
-
-      if (found) {
-        Serial.println("Adresse valide, connexion à l'appareil...");
-        connectToSelectedDevice(receivedMac);
-      } else {
-        Serial.println("Adresse non reconnue, attente nouvelle adresse...");
-      }
-    } else {
-      Serial.println("Format adresse incorrect.");
-    }
-  }
-};
-
-// --- Connexion A2DP vers l'appareil choisi ---
-void connectToSelectedDevice(const String& mac) {
-  // TODO : adapter la connexion A2DP en fonction de la MAC reçue
-  // Cette partie dépend de ta librairie A2DP.
-  // Exemple (pseudocode) :
-
-  // Convertir mac string en esp_bd_addr_t (tableau de 6 octets)
-  esp_bd_addr_t bdaddr;
-  int values[6];
-  if (sscanf(mac.c_str(), "%x:%x:%x:%x:%x:%x",
-             &values[0], &values[1], &values[2],
-             &values[3], &values[4], &values[5]) == 6) {
-    for (int i = 0; i < 6; i++) {
-      bdaddr[i] = (uint8_t)values[i];
-    }
-  } else {
-    Serial.println("Erreur conversion MAC");
-    return;
-  }
-
-  // Ici, utiliser la fonction de ta lib A2DP pour connecter :
-  // a2dp_source.connect(bdaddr);  <-- si ta lib supporte ce call
-
-  Serial.printf("Connexion à l'adresse %s...\n", mac.c_str());
-
-  // Pour l’exemple, on simule le début du stream audio
-  a2dp_source.start("D-58"); // garde ton nom d’enceinte ici ou dynamique
+  Serial.print("Reg 0x");
+  Serial.print(reg, HEX);
+  Serial.print(" updated: 0x");
+  Serial.println(updated, HEX);
 }
 
-// --- Setup audio I2S ---
+void bq25186_init() {
+  // TMR_ILIM (0x08), bits 6-7 = 00
+  bq25186_updateBits(0x08, 0b11000000, 0b00000000);
+
+  // IC_CTRL (0x07), bit 7 = 0
+  bq25186_updateBits(0x07, 0b10000011, 0b00000011);
+  bq25186_updateBits(0x04, 0b01111111, 0b00101111);
+
+
+  Serial.println("BQ25186 init done");
+}
+
+// -------- Audio Callback --------
 int32_t get_sound_data(Frame* data, int32_t frameCount) {
-  return i2s.readBytes((uint8_t*)data, frameCount * BYTES_PER_FRAME) / BYTES_PER_FRAME;
+  int byteCount = i2s.readBytes((uint8_t*)data, frameCount * BYTES_PER_FRAME);
+  int16_t* samples = (int16_t*)data;
+  int numSamples = byteCount / 2;
+  int64_t totalAmplitude = 0;
+
+  for (int i = 0; i < 100 && i < numSamples; ++i) {
+    totalAmplitude += abs(samples[i]);
+  }
+
+  int averageAmplitude = totalAmplitude / numSamples;
+  if (averageAmplitude < SILENCE_THRESHOLD) {
+    memset(data, 0, byteCount);
+  }
+
+  return byteCount / BYTES_PER_FRAME;
 }
 
-// --- Setup BLE & BT class ---
+// -------- LED function --------
+void updateLed() {
+  digitalWrite(LED_RED, HIGH);
+  digitalWrite(LED_BLUE, HIGH);
+  digitalWrite(LED_GREEN, HIGH);
+
+  switch (ledState) {
+    case 0: digitalWrite(LED_RED, LOW); break;
+    case 1: digitalWrite(LED_BLUE, LOW); break;
+    case 2: digitalWrite(LED_GREEN, LOW); break;
+    case 3: break; // tout éteint
+  }
+  ledState = (ledState + 1) % 4;
+}
+
+// -------- Désactivation du JTAG --------
+void disableJTAG() {
+  // JTAG utilise GPIO12-15 par défaut
+  gpio_reset_pin(GPIO_NUM_12);
+  gpio_reset_pin(GPIO_NUM_13);
+  gpio_reset_pin(GPIO_NUM_14);
+  gpio_reset_pin(GPIO_NUM_15);
+
+  // on configure GPIO13 pour notre LED
+  pinMode(13, OUTPUT);
+  digitalWrite(13, HIGH);
+
+  Serial.println("JTAG disabled, GPIO13 libre pour LED");
+}
+
+// -------- Setup --------
 void setup() {
   Serial.begin(115200);
 
-  // Bluetooth classique init
-  esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+  // Désactive JTAG avant d'utiliser GPIO13
+  disableJTAG();
 
-  esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-  esp_bt_controller_init(&bt_cfg);
-  esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
+  // I2C (SDA=33, SCL=32)
+  Wire.begin(33, 32);
+  bq25186_init();
 
-  esp_bluedroid_init();
-  esp_bluedroid_enable();
+  // LEDs
+  pinMode(LED_RED, OUTPUT);
+  pinMode(LED_BLUE, OUTPUT);
+  pinMode(LED_GREEN, OUTPUT);
+  updateLed();
 
-  esp_bt_gap_register_callback(bt_app_gap_cb);
-
-  // Audio I2S init
+  // Audio
+  Serial.println("starting I2S...");
   auto cfg = i2s.defaultConfig(RX_MODE);
   cfg.i2s_format = I2S_STD_FORMAT;
   cfg.copyFrom(info);
   cfg.input_device = ADC_INPUT_LINE2;
   i2s.begin(cfg);
 
-  // A2DP source init
+  Serial.println("starting A2DP...");
   a2dp_source.set_data_callback_in_frames(get_sound_data);
-
-  // --- Init BLE ---
-  NimBLEDevice::init("ESP32_BLE_Scanner");
-  NimBLEServer* pServer = NimBLEDevice::createServer();
-
-  NimBLEService* pService = pServer->createService(SERVICE_UUID);
-
-  pCharacteristicNotify = pService->createCharacteristic(
-      CHAR_NOTIFY_UUID,
-      NIMBLE_PROPERTY::NOTIFY
-  );
-
-  pCharacteristicWrite = pService->createCharacteristic(
-      CHAR_WRITE_UUID,
-      NIMBLE_PROPERTY::WRITE
-  );
-  pCharacteristicWrite->setCallbacks(new WriteCallback());
-
-  pService->start();
-
-  NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->start();
-
-  notifyClients = true;
-
-  // Démarre scan Bluetooth classique
-  esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
+  a2dp_source.start("D-58");
 }
 
+// -------- Loop --------
 void loop() {
-  // Tu peux ici relancer un scan périodique si tu veux
+unsigned long now = millis();
+
+  // ---- Bouton + LED ----
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    // Si la pin 5 est à 0 -> mettre pin 4 à 0
+    digitalWrite(LED_RED, LOW);
+    digitalWrite(LED_GREEN, HIGH);
+  } else {
+    // Sinon -> mettre pin 4 à 1
+    digitalWrite(LED_RED, HIGH);
+    digitalWrite(LED_GREEN, LOW);
+
+  }
 }
