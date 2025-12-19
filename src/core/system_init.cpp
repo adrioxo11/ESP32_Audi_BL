@@ -3,7 +3,7 @@
 #include "../bluetooth/a2dp_streamer.h"
 
 BQ25186 charger;
-A2DPStreamer audio;
+//A2DPStreamer audio;
 
 void system_init() {
     Serial.begin(115200);
@@ -13,5 +13,5 @@ void system_init() {
     Wire.begin(33, 32);
     charger.begin();
 
-    audio.begin();
+    //audio.begin();
 }
